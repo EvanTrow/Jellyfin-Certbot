@@ -1,0 +1,13 @@
+{
+	"category": "General",
+	"changelog": "1.0.0.0: Initial Release\n",
+	"description": "This plugin generates and renews an SSL cert for Jellyfin.",
+	"guid": "87cfc669-474e-46c6-9940-b32587773e57",
+	"imageUrl": "https://raw.githubusercontent.com/9p4/jellyfin-plugin-sso/main/img/logo.png",
+	"name": "Certbot",
+	"overview": "Generate and renew SSL cert",
+	"owner": "EvanTrow",
+	"targetAbi": "10.10.0.0",
+	"timestamp": "2025-03-31T13:35:04Z",
+	"version": "1.0.0.0"
+}

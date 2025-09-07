@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Template</title>
+    </head>
+    <body>
+        <div id="TemplateConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-select,emby-checkbox">
+            <div data-role="content">
+                <div class="content-primary">
+                    <form id="TemplateConfigForm">
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="Domain">Domain</label>
+                            <input id="Domain" name="Domain" type="text" is="emby-input" />
+                            <div class="fieldDescription">Domain for SSL Certificate</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="Email">ACME Account Email</label>
+                            <input id="Email" name="Email" type="text" is="emby-input" />
+                            <div class="fieldDescription">Email provided to ACME server for account info.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="textareaLabel textareaLabelUnfocused" for="Config">Configuration</label>
+                            <textarea is="emby-textarea" id="Config" label="Config" class="textarea-mono emby-textarea" rows="1" style="overflow-y: hidden; height: 150px; width: 100%"></textarea>
+                            <div class="fieldDescription">See GitHub README for config examples.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PemKey">PEM Key</label>
+                            <input id="PemKey" name="PemKey" type="text" is="emby-input" />
+                            <div class="fieldDescription">DO NOT EDIT!! Only clear if renew certificate task errors.</div>
+                        </div>
+                        <div>
+                            <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                                <span>Save</span>
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            <script type="text/javascript">
+                var TemplateConfig = {
+                    pluginUniqueId: "87cfc669-474e-46c6-9940-b32587773e57",
+                };
+
+                document.querySelector("#TemplateConfigPage").addEventListener("pageshow", function () {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(TemplateConfig.pluginUniqueId).then(function (config) {
+                        document.querySelector("#Domain").value = config.Domain;
+                        document.querySelector("#Email").value = config.Email;
+                        document.querySelector("#Config").value = config.Config;
+                        document.querySelector("#PemKey").value = config.PemKey;
+                        Dashboard.hideLoadingMsg();
+                    });
+                });
+
+                document.querySelector("#TemplateConfigForm").addEventListener("submit", function (e) {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(TemplateConfig.pluginUniqueId).then(function (config) {
+                        config.Domain = document.querySelector("#Domain").value;
+                        config.Email = document.querySelector("#Email").value;
+                        config.Config = document.querySelector("#Config").value;
+                        config.PemKey = document.querySelector("#PemKey").value;
+                        ApiClient.updatePluginConfiguration(TemplateConfig.pluginUniqueId, config).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
+                    });
+
+                    e.preventDefault();
+                    return false;
+                });
+            </script>
+        </div>
+    </body>
+</html>
