@@ -1,157 +1,176 @@
-using Certes;
-using Certes.Acme;
-using Certes.Acme.Resource;
-using Certes.Jws;
-using Certes.Pkcs;
-using MediaBrowser.Common.Net;
-using MediaBrowser.Model.Tasks;
-using Microsoft.Extensions.Logging;
-using Org.BouncyCastle.Asn1.Cmp;
-using Org.BouncyCastle.Asn1.Pkcs;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
-
-using Directory = System.IO.Directory;
+using Certes;
+using Certes.Acme;
+using Certes.Acme.Resource;
+using JellyfinCertbot.Providers;
+using MediaBrowser.Common.Configuration;
+using MediaBrowser.Common.Net;
+using MediaBrowser.Model.Tasks;
+using Microsoft.Extensions.Logging;
 
 namespace JellyfinCertbot
 {
-    // Task to renew SSL certificate using Let's Encrypt Certbot
+    /// <summary>
+    /// Scheduled task that requests or renews the SSL certificate from Let's Encrypt.
+    /// </summary>
     public class TaskRunCertbotRenew : IScheduledTask
     {
-        private readonly ITaskManager _taskManager;
-        private ILogger<TaskRunCertbotRenew> _logger;
+        private static readonly TimeSpan _dnsPropagationDelay = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan _authorizationTimeout = TimeSpan.FromSeconds(60);
 
+        private readonly IConfigurationManager _configurationManager;
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ILogger<TaskRunCertbotRenew> _logger;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="TaskRunCertbotRenew"/> class.
+        /// </summary>
+        /// <param name="logger">Instance of the <see cref="ILogger{TaskRunCertbotRenew}"/> interface.</param>
+        /// <param name="configurationManager">Instance of the <see cref="IConfigurationManager"/> interface.</param>
+        /// <param name="httpClientFactory">Instance of the <see cref="IHttpClientFactory"/> interface.</param>
         public TaskRunCertbotRenew(
             ILogger<TaskRunCertbotRenew> logger,
-            ITaskManager taskManager)
+            IConfigurationManager configurationManager,
+            IHttpClientFactory httpClientFactory)
         {
             _logger = logger;
-            _taskManager = taskManager;
-
-            _logger.LogInformation("TaskRunCertbotRenew Loaded");
+            _configurationManager = configurationManager;
+            _httpClientFactory = httpClientFactory;
         }
 
+        /// <inheritdoc />
         public string Name => "Renew SSL Certificate";
+
+        /// <inheritdoc />
         public string Key => "CertbotRenew";
-        public string Description => "Updates the SSL cert using Let's Encrypt Certbot.";
+
+        /// <inheritdoc />
+        public string Description => "Requests or renews the SSL certificate from Let's Encrypt.";
+
+        /// <inheritdoc />
         public string Category => "Maintenance";
 
-        // Defaults the triggers.
+        /// <inheritdoc />
         public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
         {
-            var trigger = new TaskTriggerInfo
-            {
-                Type = TaskTriggerInfo.TriggerWeekly,
-                TimeOfDayTicks = TimeSpan.FromMinutes(0).Ticks,
-                DayOfWeek = DayOfWeek.Monday
-            };
-            return new[] { trigger };
+            return
+            [
+                new TaskTriggerInfo
+                {
+                    Type = TaskTriggerInfoType.WeeklyTrigger,
+                    TimeOfDayTicks = TimeSpan.Zero.Ticks,
+                    DayOfWeek = DayOfWeek.Monday,
+                },
+            ];
         }
 
+        /// <inheritdoc />
         public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
         {
-            await Task.Run(async () =>
+            var plugin = CertbotPlugin.Instance ?? throw new InvalidOperationException("Certbot plugin is not initialized.");
+            var config = plugin.Configuration;
+            var domain = config.Domain.Trim();
+
+            Helpers.ValidateDomain(domain);
+            Helpers.ValidateEmail(config.Email);
+
+            AcmeContext acme;
+            if (string.IsNullOrWhiteSpace(config.PemKey))
             {
-                Helpers.ValidateDomain(CertbotPlugin.Instance.Configuration.Domain);
-                Helpers.ValidateEmail(CertbotPlugin.Instance.Configuration.Email);
+                acme = new AcmeContext(WellKnownServers.LetsEncryptV2);
+                await acme.NewAccount(config.Email.Trim(), true).ConfigureAwait(false);
 
-                AcmeContext acme = null;
-                IAccountContext account = null;
+                // Save the account key for later renewals
+                config.PemKey = acme.AccountKey.ToPem();
+                plugin.SaveConfiguration();
+            }
+            else
+            {
+                acme = new AcmeContext(WellKnownServers.LetsEncryptV2, KeyFactory.FromPem(config.PemKey));
+                await acme.Account().ConfigureAwait(false);
+            }
 
-                if (string.IsNullOrWhiteSpace(CertbotPlugin.Instance.Configuration.PemKey))
+            progress.Report(20);
+
+            _logger.LogInformation("Starting certificate renewal for {Domain}", domain);
+            var order = await acme.NewOrder([domain]).ConfigureAwait(false);
+
+            // DNS-01 challenge
+            var authz = (await order.Authorizations().ConfigureAwait(false)).First();
+            var dnsChallenge = await authz.Dns().ConfigureAwait(false);
+            var dnsTxt = acme.AccountKey.DnsTxt(dnsChallenge.Token);
+
+            using (var httpClient = _httpClientFactory.CreateClient())
+            {
+                await new CloudflareDns(httpClient, _logger)
+                    .UpsertTxtRecordAsync(config.Config, domain, dnsTxt, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            progress.Report(40);
+
+            _logger.LogInformation("Waiting {Seconds} seconds for DNS changes to propagate", _dnsPropagationDelay.TotalSeconds);
+            await Task.Delay(_dnsPropagationDelay, cancellationToken).ConfigureAwait(false);
+
+            // Ask the ACME server to validate the challenge and wait until the authorization is valid
+            await dnsChallenge.Validate().ConfigureAwait(false);
+
+            var status = await authz.Resource().ConfigureAwait(false);
+            var startTime = DateTime.UtcNow;
+            while (status.Status != AuthorizationStatus.Valid)
+            {
+                if (status.Status == AuthorizationStatus.Invalid)
                 {
-                    acme = new AcmeContext(WellKnownServers.LetsEncryptV2);
-                    account = await acme.NewAccount(CertbotPlugin.Instance.Configuration.Email, true);
-                    string pemKey = acme.AccountKey.ToPem();
-
-                    // Save the account key for later use
-                    CertbotPlugin.Instance.Configuration.PemKey = pemKey;
-                    CertbotPlugin.Instance.SaveConfiguration();
-                }
-                else
-                {
-                    // Load the saved account key
-                    var accountKey = KeyFactory.FromPem(CertbotPlugin.Instance.Configuration.PemKey);
-                    acme = new AcmeContext(WellKnownServers.LetsEncryptV2, accountKey);
-                    account = await acme.Account();
-                }
-                progress.Report(20);
-
-                _logger.LogInformation("Starting certificate renewal process for domain: " + CertbotPlugin.Instance.Configuration.Domain);
-                var order = await acme.NewOrder(new[] { CertbotPlugin.Instance.Configuration.Domain });
-
-                // get dns challenge
-                var authz = (await order.Authorizations()).First();
-                var dnsChallenge = await authz.Dns();
-                var dnsTxt = acme.AccountKey.DnsTxt(dnsChallenge.Token);
-
-                await new CloudflareDns().UpsertTxtRecordAsync(CertbotPlugin.Instance.Configuration.Config, CertbotPlugin.Instance.Configuration.Domain, dnsTxt);
-                progress.Report(40);
-
-                _logger.LogInformation("Waiting 10 seconds for DNS changes to propagate");
-                await Task.Delay(10 * 1000, cancellationToken); // Wait 10 seconds for DNS changes to propagate
-
-                // Notify ACME server to validate the challenge
-                await dnsChallenge.Validate();
-
-                // Wait until the authorization is valid, with a timeout of 60 seconds
-                var status = await authz.Resource();
-                var startTime = DateTime.UtcNow;
-                while (status.Status != AuthorizationStatus.Valid)
-                {
-                    if ((DateTime.UtcNow - startTime).TotalSeconds > 60)
-                    {
-                        throw new TimeoutException("Authorization did not become valid within 60 seconds.");
-                    }
-                    Console.WriteLine($"Status: {status.Status}, waiting...");
-                    await Task.Delay(2000, cancellationToken);
-                    status = await authz.Resource();
+                    throw new InvalidOperationException($"ACME authorization for {domain} is invalid. Check the DNS provider configuration.");
                 }
 
-                // Generate a certificate key pair
-                var privateKey = KeyFactory.NewKey(KeyAlgorithm.RS256);
+                if (DateTime.UtcNow - startTime > _authorizationTimeout)
+                {
+                    throw new TimeoutException($"Authorization did not become valid within {_authorizationTimeout.TotalSeconds} seconds.");
+                }
 
-                // Finalize order
-                var cert = await order.Generate(new CsrInfo
+                _logger.LogInformation("Authorization status: {Status}, waiting...", status.Status);
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+                status = await authz.Resource().ConfigureAwait(false);
+            }
+
+            // Generate the certificate key pair and finalize the order
+            var privateKey = KeyFactory.NewKey(KeyAlgorithm.RS256);
+            var cert = await order.Generate(
+                new CsrInfo
                 {
                     Organization = "Jellyfin",
                     OrganizationUnit = "Jellyfin",
-                    CommonName = CertbotPlugin.Instance.Configuration.Domain,
-                }, privateKey);
-                progress.Report(60);
+                    CommonName = domain,
+                },
+                privateKey).ConfigureAwait(false);
+            progress.Report(60);
 
-                // Export to PFX
-                string password = Helpers.GeneratePassword(36);
-                PfxBuilder pfx = cert.ToPfx(privateKey);
-                byte[] pfxBytes = pfx.Build(CertbotPlugin.Instance.Configuration.Domain, password);
+            // Export to PFX
+            string password = Helpers.GeneratePassword(36);
+            byte[] pfxBytes = cert.ToPfx(privateKey).Build(domain, password);
 
-                // Ensure the data folder exists before saving the certificate
-                if (!Directory.Exists(CertbotPlugin.Instance.DataFolderPath))
-                {
-                    _logger.LogInformation($"Creating data folder at {CertbotPlugin.Instance.DataFolderPath}");
-                    Directory.CreateDirectory(CertbotPlugin.Instance.DataFolderPath);
-                }
+            System.IO.Directory.CreateDirectory(plugin.DataFolderPath);
+            string certPath = Path.Combine(plugin.DataFolderPath, $"{domain}.pfx");
+            await File.WriteAllBytesAsync(certPath, pfxBytes, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Certificate saved to {CertPath}", certPath);
+            progress.Report(80);
 
-                // Save the PFX file
-                string certPath = Path.Combine(CertbotPlugin.Instance.DataFolderPath, $"{CertbotPlugin.Instance.Configuration.Domain}.pfx");
-                File.WriteAllBytes(certPath, pfxBytes);
-                _logger.LogInformation($"Certificate saved to `{certPath}` with password `{password}`");
-                progress.Report(80);
+            // Point Jellyfin's HTTPS settings at the new certificate
+            NetworkConfiguration networkConfig = _configurationManager.GetNetworkConfiguration();
+            networkConfig.EnableHttps = true;
+            networkConfig.CertificatePath = certPath;
+            networkConfig.CertificatePassword = password;
+            _configurationManager.SaveConfiguration(NetworkConfigurationStore.StoreKey, networkConfig);
+            _logger.LogInformation("Jellyfin network configuration updated to use the new certificate.");
 
-                // Update Jellyfin network configuration
-                NetworkConfiguration networkConfig = CertbotPlugin.Instance._configurationManager.GetNetworkConfiguration();
-                networkConfig.EnableHttps = true;
-                networkConfig.CertificatePath = certPath;
-                networkConfig.CertificatePassword = password;
-                CertbotPlugin.Instance._configurationManager.SaveConfiguration(NetworkConfigurationStore.StoreKey, networkConfig);
-                _logger.LogInformation("Jellyfin network configuration updated to use the new certificate.");
-
-                progress.Report(100);
-            }, cancellationToken);
+            progress.Report(100);
         }
     }
 }

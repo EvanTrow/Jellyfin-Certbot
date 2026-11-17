@@ -2,12 +2,11 @@
 # This .gitignore file was automatically created by Microsoft(R) Visual Studio.
 ################################################################################
 
-/.vs/LDAP-Auth/v15/Server/sqlite3
 */obj
 */bin
-/LDAP-Auth.sln.DotSettings.user
 /bin
-/.vs/LDAP-Auth/v15
-.ideaartifacts
+*/artifacts
+*.zip
+*.DotSettings.user
 .idea
 .vs
