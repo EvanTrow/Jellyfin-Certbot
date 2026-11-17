@@ -1,92 +1,111 @@
-﻿using Jellyfin.Data.Entities.Security;
-using Microsoft.AspNetCore.Mvc.Rendering;
-using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿using System;
+using System.Globalization;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Net.Http.Json;
+using System.Net.Mime;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 
-namespace JellyfinCertbot
+namespace JellyfinCertbot.Providers
 {
+    /// <summary>
+    /// Creates and updates ACME DNS-01 challenge records through the Cloudflare API.
+    /// </summary>
     public class CloudflareDns
     {
-        private readonly ILogger<CertbotPlugin> _logger;
+        private static readonly Uri _baseAddress = new("https://api.cloudflare.com/client/v4/");
+
         private readonly HttpClient _httpClient;
+        private readonly ILogger _logger;
 
-        public CloudflareDns()
+        /// <summary>
+        /// Initializes a new instance of the <see cref="CloudflareDns"/> class.
+        /// </summary>
+        /// <param name="httpClient">HTTP client used for Cloudflare API calls.</param>
+        /// <param name="logger">Logger instance.</param>
+        public CloudflareDns(HttpClient httpClient, ILogger logger)
         {
-            _logger = CertbotPlugin.Instance._logger;
-            _httpClient = new HttpClient();
+            _httpClient = httpClient;
+            _logger = logger;
         }
 
-        public async Task UpsertTxtRecordAsync(string json_config, string domain, string text, int ttl = 120)
+        /// <summary>
+        /// Creates or updates the <c>_acme-challenge</c> TXT record for a domain.
+        /// </summary>
+        /// <param name="jsonConfig">Provider configuration JSON, e.g. <c>{"api_token": "..."}</c>.</param>
+        /// <param name="domain">Domain being validated.</param>
+        /// <param name="text">TXT record value.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <param name="ttl">Record TTL in seconds.</param>
+        /// <returns>A task representing the asynchronous operation.</returns>
+        public async Task UpsertTxtRecordAsync(string jsonConfig, string domain, string text, CancellationToken cancellationToken, int ttl = 120)
         {
-            try
+            var config = JsonSerializer.Deserialize<Config>(jsonConfig);
+            if (string.IsNullOrWhiteSpace(config?.ApiToken))
             {
-                Config config = JsonSerializer.Deserialize<Config>(json_config);
-
-                string topDomain = Helpers.GetTopLevelDomain(domain);
-
-                _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", config.api_token);
-                _httpClient.BaseAddress = new Uri("https://api.cloudflare.com/client/v4/");
-
-                // 1. Get the Zone ID
-                var zoneResp = await _httpClient.GetAsync($"zones?name={topDomain}");
-                zoneResp.EnsureSuccessStatusCode();
-                var zoneJson = JsonDocument.Parse(await zoneResp.Content.ReadAsStringAsync());
-                var zoneId = zoneJson.RootElement.GetProperty("result")[0].GetProperty("id").GetString();
-
-                // 2. Check if record exists
-                var dnsResp = await _httpClient.GetAsync($"zones/{zoneId}/dns_records?type=TXT&name=_acme-challenge.{domain}");
-                dnsResp.EnsureSuccessStatusCode();
-                var dnsJson = JsonDocument.Parse(await dnsResp.Content.ReadAsStringAsync());
-
-                string recordId = null;
-                if (dnsJson.RootElement.GetProperty("result").GetArrayLength() > 0)
-                {
-                    recordId = dnsJson.RootElement.GetProperty("result")[0].GetProperty("id").GetString();
-                }
-
-                // Payload
-                var payload = new
-                {
-                    type = "TXT",
-                    name = $"_acme-challenge.{domain}",
-                    content = text,
-                    ttl = ttl
-                };
-                var jsonPayload = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-
-                HttpResponseMessage result;
-                if (recordId != null)
-                {
-                    // 3a. Update existing record
-                    result = await _httpClient.PutAsync($"zones/{zoneId}/dns_records/{recordId}", jsonPayload);
-                }
-                else
-                {
-                    // 3b. Create new record
-                    result = await _httpClient.PostAsync($"zones/{zoneId}/dns_records", jsonPayload);
-                }
-
-                result.EnsureSuccessStatusCode();
-
-                _logger.LogInformation($"Cloudflare DNS record {(recordId != null ? "updated" : "created")}: `_acme-challenge.{domain}` -> `{text}`");
+                throw new InvalidOperationException("Cloudflare configuration is missing \"api_token\".");
             }
-            catch (Exception ex)
+
+            string topDomain = Helpers.GetTopLevelDomain(domain);
+            string recordName = $"_acme-challenge.{domain}";
+
+            // 1. Get the zone ID
+            using var zoneJson = await SendAsync(config.ApiToken, HttpMethod.Get, $"zones?name={Uri.EscapeDataString(topDomain)}", null, cancellationToken).ConfigureAwait(false);
+            var zones = zoneJson.RootElement.GetProperty("result");
+            if (zones.GetArrayLength() == 0)
             {
-                _logger.LogError(ex, $"Cloudflare DNS update failed: {ex.Message}");
+                throw new InvalidOperationException($"No Cloudflare zone found for {topDomain}.");
             }
+
+            var zoneId = zones[0].GetProperty("id").GetString();
+
+            // 2. Check whether the record already exists
+            using var dnsJson = await SendAsync(config.ApiToken, HttpMethod.Get, $"zones/{zoneId}/dns_records?type=TXT&name={Uri.EscapeDataString(recordName)}", null, cancellationToken).ConfigureAwait(false);
+            var records = dnsJson.RootElement.GetProperty("result");
+            string? recordId = records.GetArrayLength() > 0 ? records[0].GetProperty("id").GetString() : null;
+
+            // 3. Update or create
+            var payload = JsonSerializer.Serialize(new { type = "TXT", name = recordName, content = text, ttl });
+            using var result = recordId is null
+                ? await SendAsync(config.ApiToken, HttpMethod.Post, $"zones/{zoneId}/dns_records", payload, cancellationToken).ConfigureAwait(false)
+                : await SendAsync(config.ApiToken, HttpMethod.Put, $"zones/{zoneId}/dns_records/{recordId}", payload, cancellationToken).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "Cloudflare DNS record {Action}: {RecordName}",
+                recordId is null ? "created" : "updated",
+                recordName);
         }
 
-        private class Config
+        private async Task<JsonDocument> SendAsync(string apiToken, HttpMethod method, string path, string? jsonBody, CancellationToken cancellationToken)
         {
-            public string api_token { get; set; }
+            using var request = new HttpRequestMessage(method, new Uri(_baseAddress, path));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
+            if (jsonBody is not null)
+            {
+                request.Content = new StringContent(jsonBody, Encoding.UTF8, MediaTypeNames.Application.Json);
+            }
+
+            using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new HttpRequestException(
+                    string.Format(CultureInfo.InvariantCulture, "Cloudflare API {0} {1} failed with {2}: {3}", method, path, (int)response.StatusCode, body),
+                    null,
+                    response.StatusCode);
+            }
+
+            return JsonDocument.Parse(body);
+        }
+
+        private sealed class Config
+        {
+            [JsonPropertyName("api_token")]
+            public string? ApiToken { get; set; }
         }
     }
 }
