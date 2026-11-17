@@ -8,6 +8,14 @@
     "owner": "EvanTrow",
     "versions": [
       {
+        "changelog": "Add compatibility with Jellyfin 12.4 and .NET 10.\nCloudflare API errors now fail the renewal task instead of being ignored.\nThe certificate password is no longer written to the log.\nReleases and the plugin repository manifest are now published from GitHub.",
+        "checksum": "933FE029B18E41CE8FD88E6E782293C1",
+        "sourceUrl": "https://github.com/EvanTrow/Jellyfin-Certbot/releases/download/v1.1.0.0/JellyfinCertbot.zip",
+        "targetAbi": "12.0.0.0",
+        "timestamp": "2026-11-17T18:17:31Z",
+        "version": "1.1.0.0"
+      },
+      {
         "changelog": "Initial Release",
         "checksum": "6C7BFC3B170C443AEE3D47763BE40A2E",
         "sourceUrl": "https://trowbridge.tech/jellyfin/certbot/JellyfinCertbot.zip",
